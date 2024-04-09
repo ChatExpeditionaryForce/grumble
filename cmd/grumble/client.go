@@ -90,6 +90,9 @@ type Client struct {
 	Recording       bool
 	PluginContext   []byte
 	PluginIdentity  string
+
+	// CEF
+	ircChannel string
 }
 
 // Debugf implements debug-level printing for Clients.
@@ -588,6 +591,20 @@ func (client *Client) sendChannelList() {
 	client.sendChannelTree(client.server.RootChannel())
 }
 
+func (client *Client) sendWindowedChannel() *Channel {
+	channel, exists := client.server.WindowedChannels[client.ircChannel]
+	if !exists {
+		channel = NewChannel(client.server.nextChanId, client.ircChannel)
+		channel.temporary = true
+
+		client.server.nextChanId++
+		client.server.WindowedChannels[client.ircChannel] = channel
+		log.Print("Made new channel")
+	}
+	client.sendChannelTree(channel)
+	return channel
+}
+
 func (client *Client) sendChannelTree(channel *Channel) {
 	chanstate := &mumbleproto.ChannelState{
 		ChannelId: proto.Uint32(uint32(channel.Id)),
@@ -595,18 +612,6 @@ func (client *Client) sendChannelTree(channel *Channel) {
 	}
 	if channel.parent != nil {
 		chanstate.Parent = proto.Uint32(uint32(channel.parent.Id))
-	}
-
-	if channel.HasDescription() {
-		if client.Version >= 0x10202 {
-			chanstate.DescriptionHash = channel.DescriptionBlobHashBytes()
-		} else {
-			buf, err := blobStore.Get(channel.DescriptionBlob)
-			if err != nil {
-				panic("Blobstore error.")
-			}
-			chanstate.Description = proto.String(string(buf))
-		}
 	}
 
 	if channel.IsTemporary() {
@@ -626,9 +631,6 @@ func (client *Client) sendChannelTree(channel *Channel) {
 		client.Panicf("%v", err)
 	}
 
-	for _, subchannel := range channel.children {
-		client.sendChannelTree(subchannel)
-	}
 }
 
 // Try to do a crypto resync

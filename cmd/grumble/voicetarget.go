@@ -126,7 +126,7 @@ func (vt *VoiceTarget) SendVoiceBroadcast(vb *VoiceBroadcast) {
 			vt.fromChannelsCache = fromChannels
 		}
 	}
-
+	// TODO: prevent cross-channel whispering
 	kind := buf[0] & 0xe0
 
 	if len(fromChannels) > 0 {

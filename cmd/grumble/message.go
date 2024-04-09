@@ -313,7 +313,7 @@ func (server *Server) handleChannelStateMessage(client *Client, msg *Message) {
 			userstate.Session = proto.Uint32(client.Session())
 			userstate.ChannelId = proto.Uint32(uint32(channel.Id))
 			server.userEnterChannel(client, channel, userstate)
-			server.broadcastProtoMessage(userstate)
+			server.broadcastProtoMessageWithPredicate(userstate, func(cli *Client) bool { return cli.ircChannel == client.ircChannel })
 		}
 	} else {
 		// Edit existing channel.
@@ -531,7 +531,7 @@ func (server *Server) handleUserRemoveMessage(client *Client, msg *Message) {
 	}
 
 	userremove.Actor = proto.Uint32(uint32(client.Session()))
-	if err = server.broadcastProtoMessage(userremove); err != nil {
+	if err = server.broadcastProtoMessageWithPredicate(userremove, func(cli *Client) bool { return cli.ircChannel == client.ircChannel }); err != nil {
 		server.Panicf("Unable to broadcast UserRemove message")
 		return
 	}

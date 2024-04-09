@@ -15,10 +15,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/golang-jwt/jwt/v5"
 	"hash"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -38,7 +40,7 @@ import (
 
 // The default port a Murmur server listens on
 const DefaultPort = 64738
-const DefaultWebPort = 443
+const DefaultWebPort = 8443
 const UDPPacketSize = 1024
 
 const LogOpsBeforeSync = 100
@@ -100,8 +102,9 @@ type Server struct {
 	Opus             bool
 
 	// Channels
-	Channels   map[int]*Channel
-	nextChanId int
+	Channels         map[int]*Channel
+	WindowedChannels map[string]*Channel
+	nextChanId       int
 
 	// Users
 	Users       map[uint32]*User
@@ -153,6 +156,7 @@ func NewServer(id int64) (s *Server, err error) {
 	s.nextUserId = 1
 
 	s.Channels = make(map[int]*Channel)
+	s.WindowedChannels = make(map[string]*Channel)
 	s.Channels[0] = NewChannel(0, "Root")
 	s.nextChanId = 1
 
@@ -352,9 +356,9 @@ func (server *Server) RemoveClient(client *Client, kicked bool) {
 	// If the user is disconnect via a kick, the UserRemove message has already been sent
 	// at this point.
 	if !kicked && client.state > StateClientAuthenticated {
-		err := server.broadcastProtoMessage(&mumbleproto.UserRemove{
+		err := server.broadcastProtoMessageWithPredicate(&mumbleproto.UserRemove{
 			Session: proto.Uint32(client.Session()),
-		})
+		}, func(cli *Client) bool { return cli.ircChannel == client.ircChannel })
 		if err != nil {
 			server.Panic("Unable to broadcast UserRemove message for disconnected client.")
 		}
@@ -539,11 +543,33 @@ func (server *Server) handleAuthenticate(client *Client, msg *Message) {
 		}
 	}
 
-	if client.user == nil && server.hasServerPassword() {
-		if auth.Password == nil || !server.CheckServerPassword(*auth.Password) {
-			client.RejectAuth(mumbleproto.Reject_WrongServerPW, "Invalid server password")
-			return
+	if auth.Password == nil {
+		client.RejectAuth(mumbleproto.Reject_WrongServerPW, "Invalid server password")
+		return
+	}
+
+	token, err := jwt.Parse(*auth.Password, func(token *jwt.Token) (interface{}, error) {
+		// Don't forget to validate the alg is what you expect:
+		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
+			return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
 		}
+		keyData, _ := os.ReadFile(filepath.Join(Args.DataDir, "jwtpub.pem"))
+		key, _ := jwt.ParseRSAPublicKeyFromPEM(keyData)
+		return key, nil
+	})
+	log.Printf("Auth failed: %s", err)
+	if err != nil {
+		client.RejectAuth(mumbleproto.Reject_WrongServerPW, "Invalid server password")
+		return
+	}
+
+	if claims, ok := token.Claims.(jwt.MapClaims); ok {
+		client.ircChannel = claims["channel"].(string)
+		if client.Username != claims["account"].(string) {
+			client.RejectAuth(mumbleproto.Reject_InvalidUsername, "Username doesn't match")
+		}
+	} else {
+		client.RejectAuth(mumbleproto.Reject_WrongServerPW, "Something was wrong with your JWT")
 	}
 
 	// Setup the cryptstate for the client.
@@ -619,21 +645,13 @@ func (server *Server) finishAuthenticate(client *Client) {
 	// clients to switch to a codec so the new guy can actually speak.
 	server.updateCodecVersions(client)
 
-	client.sendChannelList()
+	channel := client.sendWindowedChannel()
 
 	// Add the client to the host slice for its host address.
 	host := client.tcpaddr.IP.String()
 	server.hmutex.Lock()
 	server.hclients[host] = append(server.hclients[host], client)
 	server.hmutex.Unlock()
-
-	channel := server.RootChannel()
-	if client.IsRegistered() {
-		lastChannel := server.Channels[client.user.LastChannelId]
-		if lastChannel != nil {
-			channel = lastChannel
-		}
-	}
 
 	userstate := &mumbleproto.UserState{
 		Session:   proto.Uint32(client.Session()),
@@ -676,7 +694,7 @@ func (server *Server) finishAuthenticate(client *Client) {
 	}
 
 	server.userEnterChannel(client, channel, userstate)
-	if err := server.broadcastProtoMessage(userstate); err != nil {
+	if err := server.broadcastProtoMessageWithPredicate(userstate, func(cli *Client) bool { return cli.ircChannel == client.ircChannel }); err != nil {
 		// Server panic?
 	}
 
@@ -702,7 +720,7 @@ func (server *Server) finishAuthenticate(client *Client) {
 	}
 
 	err := client.sendMessage(&mumbleproto.ServerConfig{
-		AllowHtml:          proto.Bool(server.cfg.BoolValue("AllowHTML")),
+		AllowHtml:          proto.Bool(false),
 		MessageLength:      proto.Uint32(server.cfg.Uint32Value("MaxTextMessageLength")),
 		ImageMessageLength: proto.Uint32(server.cfg.Uint32Value("MaxImageMessageLength")),
 	})
@@ -812,6 +830,10 @@ func (server *Server) updateCodecVersions(connecting *Client) {
 
 func (server *Server) sendUserList(client *Client) {
 	for _, connectedClient := range server.clients {
+		if client.ircChannel != connectedClient.ircChannel {
+			continue
+		}
+
 		if connectedClient.state != StateClientReady {
 			continue
 		}
@@ -1231,12 +1253,10 @@ func (server *Server) RemoveChannel(channel *Channel) {
 	parent := channel.parent
 	delete(parent.children, channel.Id)
 	delete(server.Channels, channel.Id)
-	chanremove := &mumbleproto.ChannelRemove{
-		ChannelId: proto.Uint32(uint32(channel.Id)),
-	}
-	if err := server.broadcastProtoMessage(chanremove); err != nil {
-		server.Panicf("%v", err)
-	}
+	// Don't leak this
+	// if err := server.broadcastProtoMessage(chanremove); err != nil {
+	//	server.Panicf("%v", err)
+	//}
 }
 
 // RemoveExpiredBans removes expired bans
