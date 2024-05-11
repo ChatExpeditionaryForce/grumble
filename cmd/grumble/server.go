@@ -17,11 +17,13 @@ import (
 	"fmt"
 	"github.com/golang-jwt/jwt/v5"
 	"hash"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -125,6 +127,9 @@ type Server struct {
 
 	// Logging
 	*log.Logger
+
+	// CEF
+	ergo net.Conn
 }
 
 type clientLogForwarder struct {
@@ -138,6 +143,62 @@ func (lf clientLogForwarder) Write(incoming []byte) (int, error) {
 	buf.Write(incoming)
 	lf.logger.Output(3, buf.String())
 	return len(incoming), nil
+}
+
+func (server *Server) ergoMessage(action string, ircChannel string, user string, extra ...string) {
+	if server.ergo == nil {
+		return
+	}
+	str := fmt.Sprintf("%s %s %s %s\n", action, ircChannel, user, strings.Join(extra, " "))
+	server.ergo.Write([]byte(str))
+}
+
+func (server *Server) ergoStateBroadcast(client *Client) {
+	// Gooooooooo
+	muteState := b2i(client.SelfMute)
+	muteState &= b2i(client.Mute) << 1
+	deafState := b2i(client.SelfDeaf)
+	deafState &= b2i(client.Deaf) << 1
+	server.ergoMessage("VOICESTATE", client.ircChannel, client.Username, strconv.Itoa(muteState), strconv.Itoa(deafState))
+}
+
+func (server *Server) ergoConnection() {
+	conn, _ := net.Dial("tcp", "127.0.0.1:22843")
+	server.ergo = conn
+	reader := bufio.NewReader(conn)
+	println("Connection established with ergo")
+	for {
+		// read client request data
+		data, err := reader.ReadBytes(byte('\n'))
+		if err != nil {
+			if err != io.EOF {
+				fmt.Println("failed to read data, err:", err)
+			}
+			println("Reconnecting to ergo in 5s")
+			time.Sleep(5000)
+			go server.ergoConnection()
+			return
+		}
+
+		line := strings.Split(string(data[:len(data)-1]), " ")
+		fmt.Printf("ergo: %+q\n", line)
+		switch line[0] {
+		case "KICK":
+			for _, client := range server.clients {
+				if client.ircChannel == line[1] && client.Username == line[2] {
+					server.RemoveClient(client, true)
+				}
+			}
+		case "POLL":
+			channel, ok := server.WindowedChannels[line[1]]
+			if ok {
+				for _, client := range channel.clients {
+					server.ergoStateBroadcast(client)
+				}
+			}
+
+		}
+	}
 }
 
 // Allocate a new Murmur instance
@@ -162,6 +223,7 @@ func NewServer(id int64) (s *Server, err error) {
 
 	s.Logger = log.New(logtarget.Default, fmt.Sprintf("[%v] ", s.Id), log.LstdFlags|log.Lmicroseconds)
 
+	go s.ergoConnection()
 	return
 }
 
@@ -351,6 +413,7 @@ func (server *Server) RemoveClient(client *Client, kicked bool) {
 	if channel != nil {
 		channel.RemoveClient(client)
 	}
+	server.ergoMessage("PART", client.ircChannel, client.Username)
 
 	// If the user was not kicked, broadcast a UserRemove message.
 	// If the user is disconnect via a kick, the UserRemove message has already been sent
@@ -593,7 +656,7 @@ func (server *Server) handleAuthenticate(client *Client, msg *Message) {
 
 	// Add codecs
 	client.codecs = auth.CeltVersions
-	client.opus = auth.GetOpus()
+	client.opus = true // You get Opus. Too bad.
 
 	client.state = StateClientAuthenticated
 	server.clientAuthenticated <- client
@@ -641,9 +704,8 @@ func (server *Server) finishAuthenticate(client *Client) {
 		}
 	}
 
-	// First, check whether we need to tell the other connected
-	// clients to switch to a codec so the new guy can actually speak.
-	server.updateCodecVersions(client)
+	// Opus gang only.
+	// server.updateCodecVersions(client)
 
 	channel := client.sendWindowedChannel()
 
@@ -1137,6 +1199,8 @@ func (server *Server) userEnterChannel(client *Client, channel *Channel, usersta
 	if channel.parent != nil {
 		server.sendClientPermissions(client, channel.parent)
 	}
+	server.Printf("Broadcasting join: %s %s\n", client.ircChannel, client.Username)
+	server.ergoStateBroadcast(client)
 }
 
 // Register a client on the server.
@@ -1495,19 +1559,19 @@ func (server *Server) Start() (err error) {
 	if shouldListenWeb {
 		// Create HTTP server and WebSocket "listener"
 		webaddr := &net.TCPAddr{IP: net.ParseIP(host), Port: webport}
-		server.webtlscfg = &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			ClientAuth:   tls.NoClientCert,
-			NextProtos:   []string{"http/1.1"},
-		}
+		//server.webtlscfg = &tls.Config{
+		//	Certificates: []tls.Certificate{cert},
+		//	ClientAuth:   tls.NoClientCert,
+		//	NextProtos:   []string{"http/1.1"},
+		//}
 		server.webwsl = web.NewListener(webaddr, server.Logger)
 		mux := http.NewServeMux()
 		mux.Handle("/", server.webwsl)
 		server.webhttp = &http.Server{
-			Addr:      webaddr.String(),
-			Handler:   mux,
-			TLSConfig: server.webtlscfg,
-			ErrorLog:  server.Logger,
+			Addr:    webaddr.String(),
+			Handler: mux,
+			//TLSConfig: server.webtlscfg,
+			ErrorLog: server.Logger,
 
 			// Set sensible timeouts, in case no reverse proxy is in front of Grumble.
 			// Non-conforming (or malicious) clients may otherwise block indefinitely and cause
@@ -1517,7 +1581,7 @@ func (server *Server) Start() (err error) {
 			IdleTimeout:  2 * time.Minute,
 		}
 		go func() {
-			err := server.webhttp.ListenAndServeTLS("", "")
+			err := server.webhttp.ListenAndServe()
 			if err != http.ErrServerClosed {
 				server.Fatalf("Fatal HTTP server error: %v", err)
 			}
