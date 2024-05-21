@@ -156,9 +156,9 @@ func (server *Server) ergoMessage(action string, ircChannel string, user string,
 func (server *Server) ergoStateBroadcast(client *Client) {
 	// Gooooooooo
 	muteState := b2i(client.SelfMute)
-	muteState &= b2i(client.Mute) << 1
+	muteState |= b2i(client.Mute) << 1
 	deafState := b2i(client.SelfDeaf)
-	deafState &= b2i(client.Deaf) << 1
+	deafState |= b2i(client.Deaf) << 1
 	server.ergoMessage("VOICESTATE", client.ircChannel, client.Username, strconv.Itoa(muteState), strconv.Itoa(deafState))
 }
 

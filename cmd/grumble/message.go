@@ -874,7 +874,7 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 			server.ClearCaches()
 		}
 
-		server.ergoStateBroadcast(client)
+		server.ergoStateBroadcast(target)
 		err := server.broadcastProtoMessageWithPredicate(userstate, func(client *Client) bool {
 			return client.Version >= 0x10203
 		})
