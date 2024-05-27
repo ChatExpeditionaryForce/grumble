@@ -190,7 +190,7 @@ func (client *Client) disconnect(kicked bool) {
 		//
 		// In case of a premature disconnect, close the channel so the
 		// receiver routine can exit correctly.
-		if client.state == StateClientSentVersion || client.state == StateClientAuthenticated {
+		if (client.state == StateClientSentVersion || client.state == StateClientAuthenticated) && client.clientReady != nil {
 			close(client.clientReady)
 		}
 
